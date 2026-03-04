@@ -37,10 +37,14 @@
 #include "libavutil/pixfmt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/slicethread.h"
-#if HAVE_ALTIVEC
-#include "libavutil/ppc/util_altivec.h"
-#endif
 #include "libavutil/half2float.h"
+
+#if HAVE_ALTIVEC
+#define SWSINTERNAL_ADDITIONAL_ASM_SIZE (7*16 + 2*8 + /* alignment */ 16)
+#endif
+#ifndef SWSINTERNAL_ADDITIONAL_ASM_SIZE
+#define SWSINTERNAL_ADDITIONAL_ASM_SIZE 0
+#endif
 
 #define STR(s) AV_TOSTRING(s) // AV_STRINGIFY is too long
 
@@ -544,17 +548,6 @@ struct SwsInternal {
 
     const uint8_t *chrDither8, *lumDither8;
 
-#if HAVE_ALTIVEC
-    vector signed short   CY;
-    vector signed short   CRV;
-    vector signed short   CBU;
-    vector signed short   CGU;
-    vector signed short   CGV;
-    vector signed short   OY;
-    vector unsigned short CSHIFT;
-    vector signed short  *vYCoeffsBank, *vCCoeffsBank;
-#endif
-
     int use_mmx_vfilter;
 
 /* pre defined color-spaces gamma */
@@ -703,7 +696,7 @@ struct SwsInternal {
     Half2FloatTables *h2f_tables;
 
     // Hardware specific private data
-    void *hw_priv;
+    void *hw_priv; /* refstruct */
 };
 //FIXME check init (where 0)
 
@@ -742,6 +735,7 @@ av_cold int ff_sws_fill_xyztables(SwsInternal *c);
 SwsFunc ff_yuv2rgb_init_x86(SwsInternal *c);
 SwsFunc ff_yuv2rgb_init_ppc(SwsInternal *c);
 SwsFunc ff_yuv2rgb_init_loongarch(SwsInternal *c);
+SwsFunc ff_yuv2rgb_init_aarch64(SwsInternal *c);
 
 static av_always_inline int is16BPS(enum AVPixelFormat pix_fmt)
 {
@@ -1038,6 +1032,9 @@ void ff_sws_init_swscale_aarch64(SwsInternal *c);
 void ff_sws_init_swscale_arm(SwsInternal *c);
 void ff_sws_init_swscale_loongarch(SwsInternal *c);
 void ff_sws_init_swscale_riscv(SwsInternal *c);
+
+int ff_sws_init_altivec_bufs(SwsInternal *c);
+void ff_sws_free_altivec_bufs(SwsInternal *c);
 
 void ff_hyscale_fast_c(SwsInternal *c, int16_t *dst, int dstWidth,
                        const uint8_t *src, int srcW, int xInc);

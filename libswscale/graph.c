@@ -38,62 +38,70 @@
 #include "graph.h"
 #include "ops.h"
 
-static int buffer_get_sizes(SwsPassBuffer *buffer, size_t sizes[4])
+/* Allocates one buffer per plane */
+static int frame_alloc_planes(AVFrame *dst)
 {
-    const int align  = av_cpu_max_align();
-    const int format = buffer->img.fmt;
-    const int width  = FFALIGN(buffer->width, align);
-    const int height = buffer->height;
-    int ret;
-
-    ret = av_image_check_size2(width, height, INT64_MAX, format, 0, NULL);
+    int ret = av_image_check_size2(dst->width, dst->height, INT64_MAX,
+                                   dst->format, 0, NULL);
     if (ret < 0)
         return ret;
 
-    int *linesize = buffer->img.linesize;
-    ret = av_image_fill_linesizes(linesize, format, width);
+    const int align = av_cpu_max_align();
+    const int aligned_w = FFALIGN(dst->width, align);
+    ret = av_image_fill_linesizes(dst->linesize, dst->format, aligned_w);
     if (ret < 0)
         return ret;
 
     ptrdiff_t linesize1[4];
     for (int i = 0; i < 4; i++)
-        linesize1[i] = linesize[i] = FFALIGN(linesize[i], align);
+        linesize1[i] = dst->linesize[i] = FFALIGN(dst->linesize[i], align);
 
-    return av_image_fill_plane_sizes(sizes, format, height, linesize1);
+    size_t sizes[4];
+    ret = av_image_fill_plane_sizes(sizes, dst->format, dst->height, linesize1);
+    if (ret < 0)
+        return ret;
+
+    for (int i = 0; i < 4; i++) {
+        if (!sizes[i])
+            break;
+        AVBufferRef *buf = av_buffer_alloc(sizes[i]);
+        if (!buf)
+            return AVERROR(ENOMEM);
+        dst->data[i] = buf->data;
+        dst->buf[i] = buf;
+    }
+
+    return 0;
 }
 
 static int pass_alloc_output(SwsPass *pass)
 {
-    if (!pass || pass->output->buf[0])
+    if (!pass || pass->output->avframe)
         return 0;
 
-    size_t sizes[4];
-    SwsPassBuffer *output = pass->output;
-    int ret = buffer_get_sizes(output, sizes);
-    if (ret < 0)
+    SwsPassBuffer *buffer = pass->output;
+    AVFrame *avframe = av_frame_alloc();
+    if (!avframe)
+        return AVERROR(ENOMEM);
+    avframe->format = pass->format;
+    avframe->width  = buffer->width;
+    avframe->height = buffer->height;
+
+    int ret = frame_alloc_planes(avframe);
+    if (ret < 0) {
+        av_frame_free(&avframe);
         return ret;
-
-    const int align = av_cpu_max_align();
-    for (int i = 0; i < 4; i++) {
-        if (!sizes[i])
-            break;
-        if (sizes[i] > SIZE_MAX - align)
-            return AVERROR(EINVAL);
-
-        AVBufferRef *buf = av_buffer_alloc(sizes[i] + align);
-        if (!buf)
-            return AVERROR(ENOMEM);
-        output->img.data[i] = (uint8_t *) FFALIGN((uintptr_t) buf->data, align);
-        output->buf[i] = buf;
     }
+
+    buffer->avframe = avframe;
+    ff_sws_frame_from_avframe(&buffer->frame, avframe);
     return 0;
 }
 
 static void free_buffer(AVRefStructOpaque opaque, void *obj)
 {
     SwsPassBuffer *buffer = obj;
-    for (int i = 0; i < FF_ARRAY_ELEMS(buffer->buf); i++)
-        av_buffer_unref(&buffer->buf[i]);
+    av_frame_free(&buffer->avframe);
 }
 
 SwsPass *ff_sws_graph_add_pass(SwsGraph *graph, enum AVPixelFormat fmt,
@@ -130,9 +138,8 @@ SwsPass *ff_sws_graph_add_pass(SwsGraph *graph, enum AVPixelFormat fmt,
     }
 
     /* Align output buffer to include extra slice padding */
-    pass->output->img.fmt = fmt;
-    pass->output->width   = pass->width;
-    pass->output->height  = pass->slice_h * pass->num_slices;
+    pass->output->width  = pass->width;
+    pass->output->height = pass->slice_h * pass->num_slices;
 
     ret = av_dynarray_add_nofree(&graph->passes, &graph->num_passes, pass);
     if (ret < 0)
@@ -157,32 +164,43 @@ static int pass_append(SwsGraph *graph, enum AVPixelFormat fmt, int w, int h,
     return 0;
 }
 
-static void run_copy(const SwsImg *out_base, const SwsImg *in_base,
-                     int y, int h, const SwsPass *pass)
+static void frame_shift(const SwsFrame *f, const int y, uint8_t *data[4])
 {
-    SwsImg in  = ff_sws_img_shift(in_base,  y);
-    SwsImg out = ff_sws_img_shift(out_base, y);
+    for (int i = 0; i < 4; i++) {
+        if (f->data[i])
+            data[i] = f->data[i] + (y >> ff_fmt_vshift(f->format, i)) * f->linesize[i];
+        else
+            data[i] = NULL;
+    }
+}
 
-    for (int i = 0; i < FF_ARRAY_ELEMS(out.data) && out.data[i]; i++) {
-        const int lines = h >> ff_fmt_vshift(in.fmt, i);
-        av_assert1(in.data[i]);
+static void run_copy(const SwsFrame *out, const SwsFrame *in, int y, int h,
+                     const SwsPass *pass)
+{
+    uint8_t *in_data[4], *out_data[4];
+    frame_shift(in,  y, in_data);
+    frame_shift(out, y, out_data);
 
-        if (in.data[i] == out.data[i]) {
-            av_assert0(in.linesize[i] == out.linesize[i]);
-        } else if (in.linesize[i] == out.linesize[i]) {
-            memcpy(out.data[i], in.data[i], lines * out.linesize[i]);
+    for (int i = 0; i < 4 && out_data[i]; i++) {
+        const int lines = h >> ff_fmt_vshift(in->format, i);
+        av_assert1(in_data[i]);
+
+        if (in_data[i] == out_data[i]) {
+            av_assert0(in->linesize[i] == out->linesize[i]);
+        } else if (in->linesize[i] == out->linesize[i]) {
+            memcpy(out_data[i], in_data[i], lines * out->linesize[i]);
         } else {
-            const int linesize = FFMIN(out.linesize[i], in.linesize[i]);
+            const int linesize = FFMIN(out->linesize[i], in->linesize[i]);
             for (int j = 0; j < lines; j++) {
-                memcpy(out.data[i], in.data[i], linesize);
-                in.data[i]  += in.linesize[i];
-                out.data[i] += out.linesize[i];
+                memcpy(out_data[i], in_data[i], linesize);
+                in_data[i]  += in->linesize[i];
+                out_data[i] += out->linesize[i];
             }
         }
     }
 }
 
-static void run_rgb0(const SwsImg *out, const SwsImg *in, int y, int h,
+static void run_rgb0(const SwsFrame *out, const SwsFrame *in, int y, int h,
                      const SwsPass *pass)
 {
     SwsInternal *c = pass->priv;
@@ -203,7 +221,7 @@ static void run_rgb0(const SwsImg *out, const SwsImg *in, int y, int h,
     }
 }
 
-static void run_xyz2rgb(const SwsImg *out, const SwsImg *in, int y, int h,
+static void run_xyz2rgb(const SwsFrame *out, const SwsFrame *in, int y, int h,
                         const SwsPass *pass)
 {
     const SwsInternal *c = pass->priv;
@@ -212,7 +230,7 @@ static void run_xyz2rgb(const SwsImg *out, const SwsImg *in, int y, int h,
                     pass->width, h);
 }
 
-static void run_rgb2xyz(const SwsImg *out, const SwsImg *in, int y, int h,
+static void run_rgb2xyz(const SwsFrame *out, const SwsFrame *in, int y, int h,
                         const SwsPass *pass)
 {
     const SwsInternal *c = pass->priv;
@@ -233,7 +251,7 @@ static void free_legacy_swscale(void *priv)
     sws_free_context(&sws);
 }
 
-static void setup_legacy_swscale(const SwsImg *out, const SwsImg *in,
+static void setup_legacy_swscale(const SwsFrame *out, const SwsFrame *in,
                                  const SwsPass *pass)
 {
     SwsContext *sws = pass->priv;
@@ -266,26 +284,28 @@ static inline SwsContext *slice_ctx(const SwsPass *pass, int y)
     return sws;
 }
 
-static void run_legacy_unscaled(const SwsImg *out, const SwsImg *in_base,
+static void run_legacy_unscaled(const SwsFrame *out, const SwsFrame *in,
                                 int y, int h, const SwsPass *pass)
 {
     SwsContext *sws = slice_ctx(pass, y);
     SwsInternal *c = sws_internal(sws);
-    const SwsImg in = ff_sws_img_shift(in_base, y);
+    uint8_t *in_data[4];
+    frame_shift(in, y, in_data);
 
-    c->convert_unscaled(c, (const uint8_t *const *) in.data, in.linesize, y, h,
+    c->convert_unscaled(c, (const uint8_t *const *) in_data, in->linesize, y, h,
                         out->data, out->linesize);
 }
 
-static void run_legacy_swscale(const SwsImg *out_base, const SwsImg *in,
+static void run_legacy_swscale(const SwsFrame *out, const SwsFrame *in,
                                int y, int h, const SwsPass *pass)
 {
     SwsContext *sws = slice_ctx(pass, y);
     SwsInternal *c = sws_internal(sws);
-    const SwsImg out = ff_sws_img_shift(out_base, y);
+    uint8_t *out_data[4];
+    frame_shift(out, y, out_data);
 
     ff_swscale(c, (const uint8_t *const *) in->data, in->linesize, 0,
-               sws->src_h, out.data, out.linesize, y, h);
+               sws->src_h, out_data, out->linesize, y, h);
 }
 
 static void get_chroma_pos(SwsGraph *graph, int *h_chr_pos, int *v_chr_pos,
@@ -613,7 +633,7 @@ static void free_lut3d(void *priv)
     ff_sws_lut3d_free(&lut);
 }
 
-static void setup_lut3d(const SwsImg *out, const SwsImg *in, const SwsPass *pass)
+static void setup_lut3d(const SwsFrame *out, const SwsFrame *in, const SwsPass *pass)
 {
     SwsLut3D *lut = pass->priv;
 
@@ -621,15 +641,16 @@ static void setup_lut3d(const SwsImg *out, const SwsImg *in, const SwsPass *pass
     ff_sws_lut3d_update(lut, &pass->graph->src.color);
 }
 
-static void run_lut3d(const SwsImg *out_base, const SwsImg *in_base,
-                      int y, int h, const SwsPass *pass)
+static void run_lut3d(const SwsFrame *out, const SwsFrame *in, int y, int h,
+                      const SwsPass *pass)
 {
     SwsLut3D *lut = pass->priv;
-    const SwsImg in  = ff_sws_img_shift(in_base,  y);
-    const SwsImg out = ff_sws_img_shift(out_base, y);
+    uint8_t *in_data[4], *out_data[4];
+    frame_shift(in,  y, in_data);
+    frame_shift(out, y, out_data);
 
-    ff_sws_lut3d_apply(lut, in.data[0], in.linesize[0], out.data[0],
-                       out.linesize[0], pass->width, h);
+    ff_sws_lut3d_apply(lut, in_data[0], in->linesize[0], out_data[0],
+                       out->linesize[0], pass->width, h);
 }
 
 static int adapt_colors(SwsGraph *graph, SwsFormat src, SwsFormat dst,
@@ -744,7 +765,7 @@ static void sws_graph_worker(void *priv, int jobnr, int threadnr, int nb_jobs,
     const int slice_y = jobnr * pass->slice_h;
     const int slice_h = FFMIN(pass->slice_h, pass->height - slice_y);
 
-    pass->run(&graph->exec.output, &graph->exec.input, slice_y, slice_h, pass);
+    pass->run(graph->exec.output, graph->exec.input, slice_y, slice_h, pass);
 }
 
 int ff_sws_graph_create(SwsContext *ctx, const SwsFormat *dst, const SwsFormat *src,
@@ -761,14 +782,20 @@ int ff_sws_graph_create(SwsContext *ctx, const SwsFormat *dst, const SwsFormat *
     graph->field = field;
     graph->opts_copy = *ctx;
 
-    ret = avpriv_slicethread_create(&graph->slicethread, (void *) graph,
-                                    sws_graph_worker, NULL, ctx->threads);
-    if (ret == AVERROR(ENOSYS))
+    if (ctx->threads == 1) {
         graph->num_threads = 1;
-    else if (ret < 0)
-        goto error;
-    else
-        graph->num_threads = ret;
+    } else {
+        ret = avpriv_slicethread_create(&graph->slicethread, (void *) graph,
+                                        sws_graph_worker, NULL, ctx->threads);
+        if (ret == AVERROR(ENOSYS)) {
+            /* Fall back to single threaded operation */
+            graph->num_threads = 1;
+        } else if (ret < 0) {
+            goto error;
+        } else {
+            graph->num_threads = ret;
+        }
+    }
 
     ret = init_passes(graph);
     if (ret < 0)
@@ -844,37 +871,54 @@ void ff_sws_graph_update_metadata(SwsGraph *graph, const SwsColor *color)
     ff_color_update_dynamic(&graph->src.color, color);
 }
 
-static SwsImg pass_output(const SwsPass *pass, const SwsImg *fallback)
+static void get_field(SwsGraph *graph, const AVFrame *avframe, SwsFrame *frame)
 {
-    if (!pass)
-        return *fallback;
+    ff_sws_frame_from_avframe(frame, avframe);
 
-    SwsImg img = pass->output->img;
-    img.frame_ptr = fallback->frame_ptr;
-    for (int i = 0; i < FF_ARRAY_ELEMS(img.data); i++) {
-        if (!img.data[i]) {
-            img.data[i]     = fallback->data[i];
-            img.linesize[i] = fallback->linesize[i];
+    if (!(avframe->flags & AV_FRAME_FLAG_INTERLACED)) {
+        av_assert1(!graph->field);
+        return;
+    }
+
+    if (graph->field == FIELD_BOTTOM) {
+        /* Odd rows, offset by one line */
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+        for (int i = 0; i < 4; i++) {
+            if (frame->data[i])
+                frame->data[i] += frame->linesize[i];
+            if (desc->flags & AV_PIX_FMT_FLAG_PAL)
+                break;
         }
     }
 
-    return img;
+    /* Take only every second line */
+    for (int i = 0; i < 4; i++)
+        frame->linesize[i] <<= 1;
+
+    frame->height = (frame->height + (graph->field == FIELD_TOP)) >> 1;
 }
 
-void ff_sws_graph_run(SwsGraph *graph, const SwsImg *output, const SwsImg *input)
+void ff_sws_graph_run(SwsGraph *graph, const AVFrame *dst, const AVFrame *src)
 {
-    av_assert0(output->fmt == graph->dst.hw_format ||
-               output->fmt == graph->dst.format);
-    av_assert0(input->fmt  == graph->src.hw_format ||
-               input->fmt  == graph->src.format);
+    av_assert0(dst->format == graph->dst.hw_format || dst->format == graph->dst.format);
+    av_assert0(src->format == graph->src.hw_format || src->format == graph->src.format);
+
+    SwsFrame src_field, dst_field;
+    get_field(graph, dst, &dst_field);
+    get_field(graph, src, &src_field);
 
     for (int i = 0; i < graph->num_passes; i++) {
         const SwsPass *pass = graph->passes[i];
         graph->exec.pass   = pass;
-        graph->exec.input  = pass_output(pass->input, input);
-        graph->exec.output = pass_output(pass, output);
+        graph->exec.input  = pass->input ? &pass->input->output->frame : &src_field;
+        graph->exec.output = pass->output->avframe ? &pass->output->frame : &dst_field;
         if (pass->setup)
-            pass->setup(&graph->exec.output, &graph->exec.input, pass);
-        avpriv_slicethread_execute(graph->slicethread, pass->num_slices, 0);
+            pass->setup(graph->exec.output, graph->exec.input, pass);
+
+        if (graph->num_threads == 1) {
+            pass->run(graph->exec.output, graph->exec.input, 0, pass->height, pass);
+        } else {
+            avpriv_slicethread_execute(graph->slicethread, pass->num_slices, 0);
+        }
     }
 }
