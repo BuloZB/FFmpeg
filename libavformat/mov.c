@@ -1729,6 +1729,8 @@ static int64_t get_frag_time(AVFormatContext *s, AVStream *dst_st,
     }
 
     for (i = 0; i < frag_index->item[index].nb_stream_info; i++) {
+        if (dst_st->id != frag_index->item[index].stream_info[i].id)
+            continue;
         AVStream *frag_stream = NULL;
         frag_stream_info = &frag_index->item[index].stream_info[i];
         for (j = 0; j < s->nb_streams; j++) {
@@ -3697,6 +3699,9 @@ static int mov_read_sdtp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     av_freep(&sc->sdtp_data);
     sc->sdtp_count = 0;
 
+    if (entries < 0 || entries > SIZE_MAX)
+        return AVERROR(ERANGE);
+
     sc->sdtp_data = av_malloc(entries);
     if (!sc->sdtp_data)
         return AVERROR(ENOMEM);
@@ -4757,7 +4762,8 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
 
         if (!multiple_edits && !mov->advanced_editlist &&
             st->codecpar->codec_id == AV_CODEC_ID_AAC && start_time > 0)
-            sc->start_pad = start_time;
+            sc->start_pad = av_rescale_q(start_time, st->time_base,
+                    (AVRational){1, st->codecpar->sample_rate});
     }
 
     /* only use old uncompressed audio chunk demuxing when stts specifies it */
@@ -9169,6 +9175,7 @@ static int mov_read_iref_dimg(MOVContext *c, AVIOContext *pb, int version)
     HEIFGrid *grid;
     int entries, i;
     int from_item_id = version ? avio_rb32(pb) : avio_rb16(pb);
+    int ret = 0;
 
     for (int i = 0; i < c->nb_heif_grid; i++) {
         if (c->heif_grid[i].item->item_id == from_item_id) {
@@ -9203,29 +9210,40 @@ static int mov_read_iref_dimg(MOVContext *c, AVIOContext *pb, int version)
     if (!grid)
         return AVERROR(ENOMEM);
     c->heif_grid = grid;
-    grid = &grid[c->nb_heif_grid++];
+    grid = &grid[c->nb_heif_grid];
 
     entries = avio_rb16(pb);
     grid->tile_id_list = av_malloc_array(entries, sizeof(*grid->tile_id_list));
     grid->tile_idx_list = av_calloc(entries, sizeof(*grid->tile_idx_list));
     grid->tile_item_list = av_calloc(entries, sizeof(*grid->tile_item_list));
-    if (!grid->tile_id_list || !grid->tile_item_list || !grid->tile_idx_list)
-        return AVERROR(ENOMEM);
+    if (!grid->tile_id_list || !grid->tile_item_list || !grid->tile_idx_list) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
     /* 'to' item ids */
     for (i = 0; i < entries; i++) {
         grid->tile_id_list[i] = version ? avio_rb32(pb) : avio_rb16(pb);
 
-        if (avio_feof(pb))
-            return AVERROR_INVALIDDATA;
+        if (avio_feof(pb)) {
+            ret = AVERROR_INVALIDDATA;
+            goto fail;
+        }
     }
 
     grid->nb_tiles = entries;
     grid->item = item;
+    ++c->nb_heif_grid;
 
     av_log(c->fc, AV_LOG_TRACE, "dimg: from_item_id %d, entries %d\n",
            from_item_id, entries);
 
     return 0;
+fail:
+    av_freep(&grid->tile_id_list);
+    av_freep(&grid->tile_idx_list);
+    av_freep(&grid->tile_item_list);
+
+    return ret;
 }
 
 static int mov_read_iref_cdsc(MOVContext *c, AVIOContext *pb, uint32_t type, int version)
@@ -9269,6 +9287,8 @@ static int mov_read_iref_cdsc(MOVContext *c, AVIOContext *pb, uint32_t type, int
 static int mov_read_iref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 {
     int version = avio_r8(pb);
+    int ret;
+
     avio_rb24(pb); // flags
     atom.size -= 4;
 
@@ -9288,11 +9308,15 @@ static int mov_read_iref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         type = avio_rl32(pb);
         switch (type) {
         case MKTAG('d','i','m','g'):
-            mov_read_iref_dimg(c, pb, version);
+            ret = mov_read_iref_dimg(c, pb, version);
+            if (ret < 0)
+                return ret;
             break;
         case MKTAG('c','d','s','c'):
         case MKTAG('t','h','m','b'):
-            mov_read_iref_cdsc(c, pb, type, version);
+            ret = mov_read_iref_cdsc(c, pb, type, version);
+            if (ret < 0)
+                return ret;
             break;
         default:
             av_log(c->fc, AV_LOG_DEBUG, "Unknown iref type %s size %"PRIu32"\n",
@@ -10784,8 +10808,6 @@ static int mov_parse_lcevc_streams(AVFormatContext *s)
             !(sc->tref_flags & MOV_TREF_FLAG_ENHANCEMENT))
             continue;
 
-        st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
-
         stg = avformat_stream_group_create(s, AV_STREAM_GROUP_PARAMS_LCEVC, NULL);
         if (!stg)
             return AVERROR(ENOMEM);
@@ -10793,8 +10815,6 @@ static int mov_parse_lcevc_streams(AVFormatContext *s)
         stg->id = st->id;
         stg->params.lcevc->width  = st->codecpar->width;
         stg->params.lcevc->height = st->codecpar->height;
-        st->codecpar->width = 0;
-        st->codecpar->height = 0;
 
         while (st_base = mov_find_reference_track(s, st, j)) {
             err = avformat_stream_group_add_stream(stg, st_base);
