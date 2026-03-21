@@ -1,6 +1,4 @@
 /*
- * Copyright © 2024 Rémi Denis-Courmont.
- *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -18,31 +16,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define VILL -0x8000
+#ifndef AVCODEC_X86_VIDEODSP_H
+#define AVCODEC_X86_VIDEODSP_H
 
-        .data
-ff_vtype_e8:
-ff_vtype_e8_1:
-        .half   VILL
-ff_vtype_e8_2:
-        .half   VILL
-ff_vtype_e8_4:
-        .half   VILL
-ff_vtype_e8_8:
-        .half   VILL
-ff_vtype_e8_16:
-        .half   VILL
-ff_vtype_e8_32:
-        .half   VILL
+#include <stddef.h>
+#include <stdint.h>
 
-ff_vtype_e16:
-ff_vtype_e16_1:
-        .half   VILL
-ff_vtype_e16_2:
-        .half   VILL
-ff_vtype_e16_4:
-        .half   VILL
-ff_vtype_e16_8:
-        .half   VILL
-ff_vtype_e16_16:
-        .half   VILL
+void ff_emulated_edge_mc_sse2(uint8_t *buf, const uint8_t *src,
+                              ptrdiff_t buf_stride,
+                              ptrdiff_t src_stride,
+                              int block_w, int block_h,
+                              int src_x, int src_y, int w,
+                              int h);
+
+#endif /* AVCODEC_X86_VIDEODSP_H */
