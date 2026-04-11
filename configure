@@ -3286,6 +3286,7 @@ nuv_decoder_select="idctdsp"
 opus_decoder_deps="swresample"
 opus_encoder_select="audio_frame_queue"
 pdv_decoder_select="inflate_wrapper"
+pdv_encoder_select="deflate_wrapper"
 png_decoder_select="inflate_wrapper"
 png_encoder_select="deflate_wrapper llvidencdsp"
 prores_decoder_select="blockdsp idctdsp"
@@ -4283,6 +4284,7 @@ transpose_vt_filter_deps="videotoolbox VTPixelRotationSessionCreate"
 transpose_vulkan_filter_deps="vulkan spirv_library"
 unsharp_opencl_filter_deps="opencl"
 uspp_filter_deps="gpl avcodec"
+v360_vulkan_filter_deps="vulkan spirv_compiler"
 vaguedenoiser_filter_deps="gpl"
 vflip_vulkan_filter_deps="vulkan spirv_library"
 vidstabdetect_filter_deps="libvidstab"
@@ -7866,7 +7868,7 @@ fi
 if enabled vulkan; then
     check_headers spirv-headers/spirv.h ||
     check_headers spirv/unified1/spirv.h ||
-    warn "spirv-headers not found, swscale SPIR-V backend unavailable"
+    { requested vulkan && warn "spirv-headers not found, swscale SPIR-V backend unavailable"; }
 fi
 
 if enabled x86; then
