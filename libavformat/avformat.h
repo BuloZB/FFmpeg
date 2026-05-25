@@ -386,6 +386,7 @@ struct AVFrame;
  creation_time-- date when the file was created, preferably in ISO 8601.
  date         -- date when the work was created, preferably in ISO 8601.
  disc         -- number of a subset, e.g. disc in a multi-disc collection.
+ disc_subtitle-- title of a subset, e.g. disc subtitle in a multi-disc collection.
  encoder      -- name/settings of the software/hardware that produced the file.
  encoded_by   -- person/group who created the file.
  filename     -- original name of the file.
@@ -1087,12 +1088,29 @@ typedef struct AVStreamGroupLCEVC {
     int height;
 } AVStreamGroupLCEVC;
 
+/**
+ * AVStreamGroupTREF is meant to define the relation between video, audio,
+ * or subtitle streams, and a data stream containing metadata.
+ *
+ * No more than one stream of @ref AVCodecParameters.codec_type "codec_type"
+ * AVMEDIA_TYPE_DATA shall be present.
+ */
+typedef struct AVStreamGroupTREF {
+    const AVClass *av_class;
+
+    /**
+     * Index of the metadata stream in the AVStreamGroup.
+     */
+    unsigned int metadata_index;
+} AVStreamGroupTREF;
+
 enum AVStreamGroupParamsType {
     AV_STREAM_GROUP_PARAMS_NONE,
     AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT,
     AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION,
     AV_STREAM_GROUP_PARAMS_TILE_GRID,
     AV_STREAM_GROUP_PARAMS_LCEVC,
+    AV_STREAM_GROUP_PARAMS_TREF,
 };
 
 struct AVIAMFAudioElement;
@@ -1135,6 +1153,7 @@ typedef struct AVStreamGroup {
         struct AVIAMFMixPresentation *iamf_mix_presentation;
         struct AVStreamGroupTileGrid *tile_grid;
         struct AVStreamGroupLCEVC *lcevc;
+        struct AVStreamGroupTREF *tref;
     } params;
 
     /**
@@ -1540,8 +1559,12 @@ typedef struct AVFormatContext {
      * Flags to enable debugging.
      */
     int debug;
-#define FF_FDEBUG_TS        0x0001
-#define FF_FDEBUG_ID3V2     0x0002
+#define AV_FDEBUG_TS        0x0001
+#define AV_FDEBUG_ID3V2     0x0002
+
+#if FF_API_FDEBUG_TS
+#define FF_FDEBUG_TS AV_FDEBUG_TS
+#endif
 
     /**
      * The maximum number of streams.
