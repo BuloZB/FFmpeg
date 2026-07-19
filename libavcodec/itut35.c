@@ -169,6 +169,7 @@ int ff_itut_t35_parse_payload_to_struct(FFITUTT35 *const itut_t35, FFITUTT35Aux 
     case ITU_T_T35_COUNTRY_CODE_US:
         switch (itut_t35->provider_code) {
         case ITU_T_T35_PROVIDER_CODE_AOM:
+            ff_aom_uninit_film_grain_params(&metadata->aom_film_grain);
             ret = ff_aom_parse_film_grain_sets(&metadata->aom_film_grain,
                                                itut_t35->payload, itut_t35->payload_size);
             if (ret < 0)
@@ -177,6 +178,7 @@ int ff_itut_t35_parse_payload_to_struct(FFITUTT35 *const itut_t35, FFITUTT35Aux 
         case ITU_T_T35_PROVIDER_CODE_ATSC:
             switch (itut_t35->provider_oriented_code) {
             case MKBETAG('D', 'T', 'G', '1'): // afd_data
+                av_buffer_unref(&metadata->afd);
                 metadata->afd = av_buffer_alloc(1);
                 if (!metadata->afd)
                     return AVERROR(ENOMEM);
@@ -202,9 +204,12 @@ int ff_itut_t35_parse_payload_to_struct(FFITUTT35 *const itut_t35, FFITUTT35Aux 
 
             ret = av_dynamic_hdr_plus_from_t35(hdr_plus, itut_t35->payload,
                                                itut_t35->payload_size);
-            if (ret < 0)
+            if (ret < 0) {
+                av_free(hdr_plus);
                 return ret;
+            }
 
+            av_buffer_unref(&metadata->hdr_plus);
             metadata->hdr_plus = av_buffer_create((uint8_t *)hdr_plus, size, NULL, NULL, 0);
             if (!metadata->hdr_plus) {
                 av_free(hdr_plus);
@@ -228,6 +233,7 @@ int ff_itut_t35_parse_payload_to_struct(FFITUTT35 *const itut_t35, FFITUTT35Aux 
             if (ret <= 0)
                 return ret;
 
+            av_buffer_unref(&metadata->dovi);
             metadata->dovi = av_buffer_create((uint8_t *)dovi, ret, NULL, NULL, 0);
             if (!metadata->dovi) {
                 av_free(dovi);
@@ -244,9 +250,12 @@ int ff_itut_t35_parse_payload_to_struct(FFITUTT35 *const itut_t35, FFITUTT35Aux 
 
             ret = av_dynamic_hdr_smpte2094_app5_from_t35(hdr_smpte2094_app5, itut_t35->payload,
                                                          itut_t35->payload_size);
-            if (ret < 0)
+            if (ret < 0) {
+                av_free(hdr_smpte2094_app5);
                 return ret;
+            }
 
+            av_buffer_unref(&metadata->hdr_smpte2094_app5);
             metadata->hdr_smpte2094_app5 = av_buffer_create((uint8_t *)hdr_smpte2094_app5, size, NULL, NULL, 0);
             if (!metadata->hdr_smpte2094_app5) {
                 av_free(hdr_smpte2094_app5);
@@ -262,6 +271,7 @@ int ff_itut_t35_parse_payload_to_struct(FFITUTT35 *const itut_t35, FFITUTT35Aux 
     case ITU_T_T35_COUNTRY_CODE_UK:
         switch (itut_t35->provider_code) {
         case ITU_T_T35_PROVIDER_CODE_VNOVA:
+            av_buffer_unref(&metadata->lcevc);
             metadata->lcevc = av_buffer_alloc(itut_t35->payload_size);
             if (!metadata->lcevc)
                 return AVERROR(ENOMEM);
@@ -288,6 +298,7 @@ int ff_itut_t35_parse_payload_to_struct(FFITUTT35 *const itut_t35, FFITUTT35Aux 
                 return ret;
             }
 
+            av_buffer_unref(&metadata->hdr_vivid);
             metadata->hdr_vivid = av_buffer_create((uint8_t *)hdr_vivid, size, NULL, NULL, 0);
             if (!metadata->hdr_vivid) {
                 av_free(hdr_vivid);
@@ -328,12 +339,6 @@ int ff_itut_t35_parse_payload_to_frame(FFITUTT35 *const itut_t35, FFITUTT35Aux *
         ret = ff_frame_new_side_data_from_buf(avctx, frame, AV_FRAME_DATA_A53_CC, &metadata.a53_cc);
         if (ret < 0)
             return ret;
-
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-        avctx->properties |= FF_CODEC_PROPERTY_CLOSED_CAPTIONS;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
     }
 
     if (metadata.aom_film_grain.enable) {
@@ -387,9 +392,12 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
 void ff_itut_t35_unref(FFITUTT35Meta *metadata)
 {
+    ff_aom_uninit_film_grain_params(&metadata->aom_film_grain);
+    av_buffer_unref(&metadata->afd);
     av_buffer_unref(&metadata->a53_cc);
     av_buffer_unref(&metadata->hdr_plus);
     av_buffer_unref(&metadata->hdr_smpte2094_app5);
     av_buffer_unref(&metadata->lcevc);
     av_buffer_unref(&metadata->dovi);
+    av_buffer_unref(&metadata->hdr_vivid);
 }

@@ -43,6 +43,7 @@
 #include "copy_block.h"
 #include "decode.h"
 #include "exif.h"
+#include "exif_internal.h"
 #include "hwaccel_internal.h"
 #include "hwconfig.h"
 #include "idctdsp.h"
@@ -385,6 +386,7 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
     }
 
     s->nb_components = nb_components;
+    s->nb_seq_component_scans = 0;
     s->h_max         = 1;
     s->v_max         = 1;
     for (i = 0; i < nb_components; i++) {
@@ -1438,6 +1440,7 @@ static int mjpeg_decode_scan(MJpegDecodeContext *s)
     int linesize[MAX_COMPONENTS];
     GetBitContext mb_bitmask_gb = {0}; // initialize to silence gcc warning
     int bytes_per_pixel = 1 + (s->bits > 8);
+    int field_pos = -1;
     int ret;
 
     if (s->avctx->codec_id == AV_CODEC_ID_MXPEG) {
@@ -1571,9 +1574,11 @@ next_field:
     if (s->interlaced &&
         bytestream2_get_bytes_left(&s->gB) > 2 &&
         bytestream2_tell(&s->gB) > 2 &&
+        bytestream2_tell(&s->gB) != field_pos &&
         s->gB.buffer[-2] == 0xFF &&
         s->gB.buffer[-1] == 0xD1) {
         av_log(s->avctx, AV_LOG_DEBUG, "AVRn interlaced picture marker found\n");
+        field_pos = bytestream2_tell(&s->gB);
         s->bottom_field ^= 1;
 
         goto next_field;
@@ -1765,6 +1770,16 @@ int ff_mjpeg_decode_sos(MJpegDecodeContext *s)
     /* mjpeg-b can have padding bytes between sos and image data, skip them */
     if (s->mjpb_skiptosod)
         bytestream2_skip(&s->gB, s->mjpb_skiptosod);
+
+    if (!s->progressive && !s->lossless &&
+        s->avctx->codec_id != AV_CODEC_ID_MXPEG) {
+        s->nb_seq_component_scans += s->nb_components_sos;
+        if (s->nb_seq_component_scans > s->nb_components) {
+            av_log(s->avctx, AV_LOG_ERROR,
+                   "too many scans for a sequential image\n");
+            return AVERROR_INVALIDDATA;
+        }
+    }
 
     if (s->avctx->hwaccel) {
         const uint8_t *buf_ptr;
@@ -2389,6 +2404,7 @@ int ff_mjpeg_decode_frame_from_buf(AVCodecContext *avctx, AVFrame *frame,
     int is16bit;
 
     s->force_pal8 = 0;
+    s->total_ls_decoded_height = 0;
 
     s->buf_size = buf_size;
 
@@ -2500,11 +2516,6 @@ redo_for_pal8:
             break;
         case SOF3:
             avctx->profile     = AV_PROFILE_MJPEG_HUFFMAN_LOSSLESS;
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-            avctx->properties |= FF_CODEC_PROPERTY_LOSSLESS;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
             s->lossless    = 1;
             s->ls          = 0;
             s->progressive = 0;
@@ -2513,11 +2524,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
             break;
         case SOF55:
             avctx->profile     = AV_PROFILE_MJPEG_JPEG_LS;
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-            avctx->properties |= FF_CODEC_PROPERTY_LOSSLESS;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
             s->lossless    = 1;
             s->ls          = 1;
             s->progressive = 0;
@@ -2755,7 +2761,7 @@ the_end:
             }
         }
     }
-    if (s->flipped && !s->rgb) {
+    if (s->flipped && !s->rgb && !s->bayer) {
         ret = av_pix_fmt_get_chroma_sub_sample(avctx->pix_fmt, &hshift, &vshift);
         if (ret)
             return ret;

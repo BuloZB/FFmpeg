@@ -57,7 +57,7 @@
 #include "libavcodec/flac.h"
 #include "libavcodec/itut35.h"
 #include "libavcodec/mpeg4audio.h"
-#include "libavcodec/packet_internal.h"
+#include "packet_internal.h"
 
 #include "avformat.h"
 #include "avio_internal.h"
@@ -1339,6 +1339,13 @@ static int ebml_parse(MatroskaDemuxContext *matroska,
 
             if ((unsigned)list->nb_elem + 1 >= UINT_MAX / syntax->list_elem_size)
                 return AVERROR(ENOMEM);
+            if (syntax->id == MATROSKA_ID_TRACKENTRY &&
+                list->nb_elem >= matroska->ctx->max_streams) {
+                av_log(matroska->ctx, AV_LOG_ERROR,
+                       "Number of tracks exceeds max_streams (%d)\n",
+                       matroska->ctx->max_streams);
+                return AVERROR(EINVAL);
+            }
             newelem = av_fast_realloc(list->elem,
                                       &list->alloc_elem_size,
                                       (list->nb_elem + 1) * syntax->list_elem_size);
@@ -3577,7 +3584,7 @@ static int matroska_deliver_packet(MatroskaDemuxContext *matroska,
         MatroskaTrack *tracks = matroska->tracks.elem;
         MatroskaTrack *track;
 
-        avpriv_packet_list_get(&matroska->queue, pkt);
+        ff_packet_list_get(&matroska->queue, pkt);
         track = &tracks[pkt->stream_index];
         if (track->has_palette) {
             uint8_t *pal = av_packet_new_side_data(pkt, AV_PKT_DATA_PALETTE, AVPALETTE_SIZE);
@@ -3599,7 +3606,7 @@ static int matroska_deliver_packet(MatroskaDemuxContext *matroska,
  */
 static void matroska_clear_queue(MatroskaDemuxContext *matroska)
 {
-    avpriv_packet_list_free(&matroska->queue);
+    ff_packet_list_free(&matroska->queue);
 }
 
 static int matroska_parse_laces(MatroskaDemuxContext *matroska, uint8_t **buf,
@@ -3765,7 +3772,7 @@ static int matroska_parse_rm_audio(MatroskaDemuxContext *matroska,
         track->audio.buf_timecode = AV_NOPTS_VALUE;
         pkt->pos                  = pos;
         pkt->stream_index         = st->index;
-        ret = avpriv_packet_list_put(&matroska->queue, pkt, NULL, 0);
+        ret = ff_packet_list_put(&matroska->queue, pkt, NULL, 0);
         if (ret < 0) {
             av_packet_unref(pkt);
             return AVERROR(ENOMEM);
@@ -3984,7 +3991,7 @@ static int matroska_parse_webvtt(MatroskaDemuxContext *matroska,
     pkt->duration = duration;
     pkt->pos = pos;
 
-    err = avpriv_packet_list_put(&matroska->queue, pkt, NULL, 0);
+    err = ff_packet_list_put(&matroska->queue, pkt, NULL, 0);
     if (err < 0) {
         av_packet_unref(pkt);
         return AVERROR(ENOMEM);
@@ -4248,7 +4255,7 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
     pkt->pos = pos;
     pkt->duration = lace_duration;
 
-    res = avpriv_packet_list_put(&matroska->queue, pkt, NULL, 0);
+    res = ff_packet_list_put(&matroska->queue, pkt, NULL, 0);
     if (res < 0) {
         av_packet_unref(pkt);
         return AVERROR(ENOMEM);
@@ -4618,7 +4625,8 @@ static CueDesc get_cue_desc(AVFormatContext *s, int64_t ts, int64_t cues_start) 
         cue_desc.end_offset = cues_start - matroska->segment_start;
     }
 
-    if (cue_desc.end_time_ns < cue_desc.start_time_ns)
+    if (cue_desc.end_time_ns < cue_desc.start_time_ns ||
+        cue_desc.end_time_ns - (uint64_t)cue_desc.start_time_ns > INT64_MAX)
         return (CueDesc) {-1, -1, -1, -1};
 
     return cue_desc;
@@ -4812,11 +4820,14 @@ static int64_t webm_dash_manifest_compute_bandwidth(AVFormatContext *s, int64_t 
             bits_per_second = 0.0;
             do {
                 int64_t desc_bytes = desc_end.end_offset - desc_beg.start_offset;
-                int64_t desc_ns = desc_end.end_time_ns - desc_beg.start_time_ns;
                 double desc_sec, calc_bits_per_second, percent, mod_bits_per_second;
                 if (desc_bytes <= 0 || desc_bytes > INT64_MAX/8)
                     return -1;
+                if (desc_end.end_time_ns <= desc_beg.start_time_ns ||
+                    desc_end.end_time_ns - (uint64_t)desc_beg.start_time_ns > INT64_MAX)
+                    return -1;
 
+                int64_t desc_ns = desc_end.end_time_ns - desc_beg.start_time_ns;
                 desc_sec = desc_ns / nano_seconds_per_second;
                 calc_bits_per_second = (desc_bytes * 8) / desc_sec;
 

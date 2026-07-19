@@ -38,12 +38,12 @@ static void check_crc(const AVCRC *table_new, const char *name, unsigned idx)
 {
     declare_func(uint32_t, const AVCRC *ctx, uint32_t crc,
                  const uint8_t *buffer, size_t length);
-    const AVCRC *table_ref = check_key((AVCRC*)table_new, "crc_%s", name);
+    const AVCRC *table_ref = (const AVCRC *) check_key((CheckasmKey) table_new, "crc_%s", name);
 
     if (!table_ref)
         return;
 
-    DECLARE_ALIGNED(4, uint8_t, buf)[8192];
+    DECLARE_ALIGNED(4, uint8_t, buf)[16384];
     static size_t offsets[AV_CRC_MAX + 1];
     static size_t sizes[AV_CRC_MAX + 1];
     static unsigned sizes_initialized = 0;
